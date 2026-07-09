@@ -1,0 +1,15 @@
+let lookback = 2h;
+requests
+| where timestamp > ago(lookback)
+| extend feature = tostring(customDimensions.feature),
+         flagState = tostring(customDimensions.flagState),
+         rolloutPercent = toint(customDimensions.rolloutPercent),
+         userBucket = toint(customDimensions.userBucket)
+| where feature == "RiskyFeature"
+| summarize
+    requests = count(),
+    failures = countif(success == false),
+    failureRate = round(100.0 * countif(success == false) / count(), 2),
+    p95 = percentile(duration, 95)
+  by flagState, rolloutPercent
+| order by rolloutPercent asc, flagState asc

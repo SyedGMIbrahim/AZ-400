@@ -1,0 +1,209 @@
+trigger:
+- main
+
+parameters:
+- name: appServiceName
+  displayName: App Service name
+  type: string
+  default: az400-canary-web
+- name: resourceGroup
+  displayName: Resource group
+  type: string
+  default: az400-canary-rg
+- name: appConfigName
+  displayName: App Configuration name
+  type: string
+  default: az400-canary-config
+- name: applicationInsightsName
+  displayName: Application Insights name
+  type: string
+  default: az400-canary-ai
+- name: demoTrafficUrl
+  displayName: Demo traffic URL
+  type: string
+  default: ""
+- name: injectSpikeAt25
+  displayName: Inject a simulated spike at 25 percent
+  type: boolean
+  default: false
+
+variables:
+  azureServiceConnection: az400-prod-sc
+  featureName: RiskyFeature
+  rolloutFeatureKey: .appconfig.featureflag/RiskyFeature
+
+stages:
+- stage: Build
+  displayName: Build and security gate
+  jobs:
+  - job: Build
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - task: NodeTool@0
+      inputs:
+        versionSpec: 20.x
+    - script: npm install
+      displayName: Install dependencies
+    - script: npm test
+      displayName: Run unit tests
+    - script: npm audit --audit-level=high
+      displayName: Security gate
+    - task: ArchiveFiles@2
+      inputs:
+        rootFolderOrFile: $(Build.SourcesDirectory)
+        includeRootFolder: false
+        archiveType: zip
+        archiveFile: $(Build.ArtifactStagingDirectory)/canary-demo.zip
+        replaceExistingArchive: true
+    - publish: $(Build.ArtifactStagingDirectory)/canary-demo.zip
+      artifact: drop
+
+- stage: DeployDark
+  displayName: Deploy code with the feature dark
+  dependsOn: Build
+  jobs:
+  - job: Deploy
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - download: current
+      artifact: drop
+    - task: AzureWebApp@1
+      displayName: Deploy web app
+      inputs:
+        azureSubscription: $(azureServiceConnection)
+        appType: webAppLinux
+        appName: ${{ parameters.appServiceName }}
+        package: $(Pipeline.Workspace)/drop/canary-demo.zip
+    - task: AzureCLI@2
+      displayName: Set the feature flag to 0 percent
+      inputs:
+        azureSubscription: $(azureServiceConnection)
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          bash ./scripts/rollout-flag.sh "${{ parameters.appConfigName }}" 0 "$(featureName)"
+
+- stage: Rollout5
+  displayName: Roll out to 5 percent
+  dependsOn: DeployDark
+  jobs:
+  - job: UpdateFlag
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - checkout: self
+    - task: AzureCLI@2
+      displayName: Roll the flag to 5 percent
+      inputs:
+        azureSubscription: $(azureServiceConnection)
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          bash ./scripts/rollout-flag.sh "${{ parameters.appConfigName }}" 5 "$(featureName)"
+    - task: AzureCLI@2
+      displayName: Query telemetry after 5 percent
+      inputs:
+        azureSubscription: $(azureServiceConnection)
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          query=$(cat scripts/query-flag-telemetry.kql)
+          az monitor app-insights query \
+            --app "${{ parameters.applicationInsightsName }}" \
+            --analytics-query "$query" \
+            --timespan 2h
+  - job: Review5
+    displayName: Review 5 percent telemetry
+    dependsOn: UpdateFlag
+    pool: server
+    steps:
+    - task: ManualValidation@0
+      inputs:
+        instructions: Review the Application Insights output for the flag-on cohort and continue only if error rate and p95 latency stay within guardrails.
+        onTimeout: reject
+
+- stage: Rollout25
+  displayName: Roll out to 25 percent and test the spike
+  dependsOn: Rollout5
+  jobs:
+  - job: UpdateFlag
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - checkout: self
+    - task: AzureCLI@2
+      displayName: Roll the flag to 25 percent
+      inputs:
+        azureSubscription: $(azureServiceConnection)
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          bash ./scripts/rollout-flag.sh "${{ parameters.appConfigName }}" 25 "$(featureName)"
+    - task: Bash@3
+      displayName: Generate demo traffic
+      inputs:
+        targetType: inline
+        script: |
+          if [[ -z "${{ parameters.demoTrafficUrl }}" ]]; then
+            echo "No demo traffic URL was supplied, so this stage only updates the flag and queries telemetry."
+            exit 0
+          fi
+
+          if [[ "${{ parameters.injectSpikeAt25 }}" == "true" ]]; then
+            bash ./scripts/send-demo-traffic.sh "${{ parameters.demoTrafficUrl }}" 40 true
+          else
+            bash ./scripts/send-demo-traffic.sh "${{ parameters.demoTrafficUrl }}" 40 false
+          fi
+    - task: AzureCLI@2
+      displayName: Query telemetry after 25 percent
+      inputs:
+        azureSubscription: $(azureServiceConnection)
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          query=$(cat scripts/query-flag-telemetry.kql)
+          az monitor app-insights query \
+            --app "${{ parameters.applicationInsightsName }}" \
+            --analytics-query "$query" \
+            --timespan 2h
+  - job: Review25
+    displayName: Decide whether to continue or roll back
+    dependsOn: UpdateFlag
+    pool: server
+    steps:
+    - task: ManualValidation@0
+      inputs:
+        instructions: Review the 25 percent telemetry. If the flag-on cohort shows an error spike, reject this validation and run the rollback script without redeploying.
+        onTimeout: reject
+
+- stage: Rollout100
+  displayName: Complete the rollout to 100 percent
+  dependsOn: Rollout25
+  jobs:
+  - job: UpdateFlag
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - checkout: self
+    - task: AzureCLI@2
+      displayName: Roll the flag to 100 percent
+      inputs:
+        azureSubscription: $(azureServiceConnection)
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          bash ./scripts/rollout-flag.sh "${{ parameters.appConfigName }}" 100 "$(featureName)"
+    - task: AzureCLI@2
+      displayName: Query telemetry after 100 percent
+      inputs:
+        azureSubscription: $(azureServiceConnection)
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          query=$(cat scripts/query-flag-telemetry.kql)
+          az monitor app-insights query \
+            --app "${{ parameters.applicationInsightsName }}" \
+            --analytics-query "$query" \
+            --timespan 2h
