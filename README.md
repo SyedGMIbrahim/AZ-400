@@ -5,10 +5,7 @@ The risky code path is deployed dark, then exposed gradually at 5%, 25%, and 100
 
 ## What is included
 
-- `src/` contains a small Node.js service that reads the `RiskyFeature` flag from Azure App Configuration and emits Application Insights telemetry tagged with flag state.
-- `azure-pipelines.yml` defines a multi-stage Azure Pipelines flow with a security gate, rollout stages, and manual review points.
-- `scripts/` contains rollout, rollback, and telemetry query helpers.
-- `docs/canary-release.md` explains the release strategy and the telemetry needed to make the rollout decision.
+- Minimal Node.js app (`src/`) with feature-flag gating and Application Insights telemetry, pipeline YAML (`azure-pipelines.yml`), helper scripts (`scripts/`), and documentation (`docs/`).
 
 ## Local development
 
@@ -29,41 +26,86 @@ Required runtime settings:
 The flag is stored as `.appconfig.featureflag/RiskyFeature` in Azure App Configuration.
 The rollback path disables that flag in place, which is the core AZ-400 lesson: release can be reversed without rebuilding or redeploying.
 
-## Pipeline behavior
+## Quick overview
 
-The pipeline should:
-
-- build and test the app;
-- run a security gate with `npm audit --audit-level=high`;
-- deploy the app with the risky feature dark;
-- raise the flag to 5%, then 25%, then 100%;
-- query Application Insights between stages;
-- stop or roll back when the telemetry breaches the guardrail.
-
-## Instant rollback
-
-Use `scripts/rollback-flag.sh` to disable the feature flag immediately.
-That leaves the deployed code in place and removes user exposure from the risky path.
-
-## Demo note
-
-For the 25% checkpoint, simulate an error spike by calling the risky endpoint with `?fault=1` or by enabling `SIMULATE_RISK_SPIKE=true` in a demo environment.
-Then review the Application Insights query output before deciding whether to continue or roll back.
-
-## Next Steps To Complete The Project
-
-1. Create or confirm the Azure App Configuration instance, the Application Insights resource, and the app host you will deploy to.
-2. Add the Azure DevOps service connection and replace the placeholder values in `azure-pipelines.yml` with your real resource names.
-3. Store runtime secrets in Azure DevOps secret variables or Azure Key Vault, then link them to the pipeline and app settings.
-4. Create the `RiskyFeature` flag in Azure App Configuration and verify that the default state is fully dark at 0%.
-5. Run the build stage once to confirm unit tests and the security gate pass before any rollout.
-6. Deploy the app with the feature off, then validate that `/healthz` and the root endpoint respond correctly.
-7. Increase the flag to 5% and check the Application Insights query output for the on-versus-off cohorts.
-8. At 25%, intentionally trigger the simulated spike, inspect the telemetry, and decide whether to pause, continue, or roll back.
-9. If the spike is unacceptable, disable the flag immediately with `scripts/rollback-flag.sh` and confirm no redeploy was required.
-10. If the telemetry stays healthy, advance the flag to 100% and capture the final metrics snapshot.
-11. Document the final rollout decision, the rollback demonstration, and the telemetry comparison so the project is ready to present.
+- The pipeline builds and tests the app, enforces a security gate (`npm audit`), deploys the code dark, and uses Azure App Configuration feature flags to roll out the risky path (0% → 5% → 25% → 100%) with manual review gates and an instant rollback via `scripts/rollback-flag.sh`.
 
 ## Definition Of Done
 
 The project is complete when the pipeline runs end to end, the feature can be rolled out and rolled back without redeployment, the security gate passes, and Application Insights shows a real comparison between the flagged and unflagged cohorts.
+
+## Completed Work (so far)
+
+- Added a minimal Node.js app that reads the `RiskyFeature` flag, emits Application Insights telemetry, and exposes `/api/risky-feature` and `/healthz` (`src/`).
+- Implemented feature-flag evaluation helpers and local fallback behavior (`src/featureFlagService.js`).
+- Instrumented telemetry helpers and Application Insights integration (`src/telemetry.js`).
+- Wrote unit tests for the flag logic (`test/featureFlagService.test.js`).
+- Added rollout and rollback scripts for Azure App Configuration (`scripts/rollout-flag.sh`, `scripts/rollback-flag.sh`) and a flag query helper (`scripts/get-flag.sh`).
+- Added a demo traffic generator (`scripts/send-demo-traffic.sh`) and a KQL telemetry query helper (`scripts/query-flag-telemetry.kql`).
+- Created an Azure Pipelines multi-stage YAML with build, deploy (dark), and staged rollout stages plus manual review gates (`azure-pipelines.yml`).
+- Added infrastructure IaC (Bicep): App Configuration, Application Insights, App Service plan + Web App, and Key Vault (`infra/main.bicep`) and a deploy helper (`scripts/deploy-infra.sh`).
+- Added deployment runbook and cost-governance notes (`docs/runbook-deploy.md`, `docs/cost-governance.md`, `docs/canary-release.md`).
+- Validated scripts with `bash -n` and committed & pushed the repo to GitHub (`git` commit `Initial canary release scaffold`).
+
+## Remaining Implementation Steps (ordered)
+
+1. Deploy the Azure resources with the provided Bicep template and capture outputs (requires `az login`):
+
+```bash
+# example (replace names/locations as needed)
+bash scripts/deploy-infra.sh az400-canary-rg eastus2 az400canary
+
+# retrieve deployment outputs (resource names)
+az deployment group show --resource-group az400-canary-rg --name <deployment-name> -o json
+```
+
+2. Store runtime secrets (App Configuration connection string and App Insights connection string) in Key Vault or the pipeline secret store. Example using Key Vault:
+
+```bash
+az appconfig credential list --name <appConfigName> -o json
+az keyvault secret set --vault-name <keyVaultName> --name APP_CONFIG_CONNECTION_STRING --value "<connection-string>"
+az monitor app-insights component show --app <appInsightsName> -g <resourceGroup> -o json
+az keyvault secret set --vault-name <keyVaultName> --name APPLICATIONINSIGHTS_CONNECTION_STRING --value "<connection-string>"
+```
+
+3. Create an Azure DevOps service connection scoped to the resource group (or a least-privilege service principal) and add it to the pipeline as `azureServiceConnection`. Alternatively configure a GitHub Actions workflow with similar steps.
+
+4. Update `azure-pipelines.yml` pipeline variables (or a variable group) with the real names: `resourceGroup`, `appServiceName`, `appConfigName`, `applicationInsightsName`, `keyVaultName`, and set the `azureServiceConnection` to the service connection name.
+
+5. Run the pipeline once to execute the Build stage (unit tests + `npm audit`). Fix any failing tests or high-severity audit findings.
+
+6. Start the pipeline to perform the Deploy (dark) stage. After deployment, verify the service is healthy:
+
+```bash
+curl -f https://<app-host>/healthz
+curl -s https://<app-host>/ | jq .
+```
+
+7. Create or verify the `RiskyFeature` flag is present and dark (0%):
+
+```bash
+bash scripts/rollout-flag.sh <appConfigName> 0
+bash scripts/get-flag.sh <appConfigName>
+```
+
+8. Roll the flag to 5% (pipeline stage or manual) and examine Application Insights using the provided KQL (`scripts/query-flag-telemetry.kql`) to compare `flagState == on` vs `off` cohorts.
+
+9. Roll the flag to 25% and (optionally) inject the simulated spike using `scripts/send-demo-traffic.sh` or the `?fault=1` query parameter to the risky endpoint. Inspect telemetry for error rate and latency deltas.
+
+10. If the 25% stage shows unacceptable degradation, run:
+
+```bash
+bash scripts/rollback-flag.sh <appConfigName>
+```
+
+to disable the flag instantly without redeploying.
+
+11. If telemetry is healthy, advance to 100% and capture final metrics snapshot via Application Insights and the KQL helper.
+
+12. Document the final rollout decision, include the KQL outputs and screenshots, and add the rollback demonstration steps to `docs/canary-release.md` for presentation.
+
+## Notes and Constraints
+
+- I implemented the IaC, scripts, pipeline YAML, and app instrumentation but cannot run `az` or create service connections or Key Vault secrets on your behalf without your credentials and tenant-level permissions.
+- Use Key Vault or the Azure DevOps secret store for all secrets—never commit connection strings or keys to source control.
+- If you want, I can generate an Azure DevOps variable group JSON or a `gh`/`az` command snippet to create the service connection and set variables; choose which I should produce next.
