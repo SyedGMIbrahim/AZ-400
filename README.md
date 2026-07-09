@@ -49,60 +49,122 @@ The project is complete when the pipeline runs end to end, the feature can be ro
 
 ## Remaining Implementation Steps (ordered)
 
-1. Deploy the Azure resources with the provided Bicep template and capture outputs (requires `az login`):
+Follow these platform-specific steps on Azure. Commands assume the `az` CLI is installed and you are signed in (`az login`). Replace placeholder names in angle brackets.
+
+1) Deploy infrastructure (Bicep)
 
 ```bash
-# example (replace names/locations as needed)
-bash scripts/deploy-infra.sh az400-canary-rg eastus2 az400canary
+# Create resource group
+az group create --name <resourceGroup> --location <location>
 
-# retrieve deployment outputs (resource names)
-az deployment group show --resource-group az400-canary-rg --name <deployment-name> -o json
+# Deploy the Bicep template included in `infra/main.bicep`
+bash scripts/deploy-infra.sh <resourceGroup> <location> <namePrefix>
+
+# Example: bash scripts/deploy-infra.sh az400-canary-rg eastus2 az400canary
+
+# Get deployment outputs (to read resource names)
+az deployment group show --resource-group <resourceGroup> --name <deploymentName> -o json
 ```
 
-2. Store runtime secrets (App Configuration connection string and App Insights connection string) in Key Vault or the pipeline secret store. Example using Key Vault:
+2) Create a service principal for CI/CD (least-privilege) and assign role on the resource group
 
 ```bash
+# create an SP with contributor rights to the resource group
+az ad sp create-for-rbac --name "http://az400-canary-sp" \
+	--role Contributor \
+	--scopes "/subscriptions/$(az account show --query id -o tsv)/resourceGroups/<resourceGroup>" \
+	-o json
+
+# Save the output (appId, password, tenant) — these are used for the Azure DevOps service connection.
+```
+
+3) Store secrets in Key Vault (or pipeline secret store)
+
+```bash
+# Example: obtain App Configuration connection string
 az appconfig credential list --name <appConfigName> -o json
+
+# Store secrets in Key Vault
 az keyvault secret set --vault-name <keyVaultName> --name APP_CONFIG_CONNECTION_STRING --value "<connection-string>"
-az monitor app-insights component show --app <appInsightsName> -g <resourceGroup> -o json
-az keyvault secret set --vault-name <keyVaultName> --name APPLICATIONINSIGHTS_CONNECTION_STRING --value "<connection-string>"
+az keyvault secret set --vault-name <keyVaultName> --name APPLICATIONINSIGHTS_CONNECTION_STRING --value "<ai-connection-string>"
 ```
 
-3. Create an Azure DevOps service connection scoped to the resource group (or a least-privilege service principal) and add it to the pipeline as `azureServiceConnection`. Alternatively configure a GitHub Actions workflow with similar steps.
+4) Create the Azure DevOps service connection
 
-4. Update `azure-pipelines.yml` pipeline variables (or a variable group) with the real names: `resourceGroup`, `appServiceName`, `appConfigName`, `applicationInsightsName`, `keyVaultName`, and set the `azureServiceConnection` to the service connection name.
+Option A — create via Azure DevOps portal:
+- In your Azure DevOps project: Project settings → Service connections → New service connection → Azure Resource Manager → Service principal (manual) → paste `appId`/`password`/`tenant` and scope to the resource group.
 
-5. Run the pipeline once to execute the Build stage (unit tests + `npm audit`). Fix any failing tests or high-severity audit findings.
-
-6. Start the pipeline to perform the Deploy (dark) stage. After deployment, verify the service is healthy:
+Option B — create via `az devops` extension (requires `az extension add --name azure-devops` and `az devops login`):
 
 ```bash
+az devops service-endpoint azurerm create \
+	--name "az400-prod-sc" \
+	--resource-group <resourceGroup> \
+	--subscription-id $(az account show --query id -o tsv) \
+	--service-principal-id <appId> \
+	--service-principal-secret <password> \
+	--tenant-id <tenant>
+```
+
+5) Wire pipeline variables and Key Vault in Azure DevOps
+
+- Add a variable group or pipeline variables: `resourceGroup`, `appServiceName`, `appConfigName`, `applicationInsightsName`, `keyVaultName`, and set `azureServiceConnection` to the service connection name.
+- Optionally link Key Vault secrets as pipeline variables (Library → Variable groups → Link secrets from an Azure key vault)
+
+6) Create the initial `RiskyFeature` flag (dark)
+
+```bash
+# Use the helper script (writes a feature flag JSON to App Configuration)
+bash scripts/rollout-flag.sh <appConfigName> 0
+
+# Verify the stored flag
+bash scripts/get-flag.sh <appConfigName>
+```
+
+7) Run the pipeline (Azure DevOps)
+
+- Trigger the pipeline in Azure DevOps. The first run should complete the Build stage (unit tests + `npm audit`).
+- If you prefer CLI: install `az devops` and run `az pipelines run --name <pipelineName>`.
+
+8) Post-deploy verification
+
+```bash
+# Verify the app is healthy after Deploy (dark)
 curl -f https://<app-host>/healthz
 curl -s https://<app-host>/ | jq .
 ```
 
-7. Create or verify the `RiskyFeature` flag is present and dark (0%):
+9) Canary rollout and telemetry checks
+
+- Roll to 5% using `bash scripts/rollout-flag.sh <appConfigName> 5` (or let the pipeline stage do it).
+- Query Application Insights using the KQL in `scripts/query-flag-telemetry.kql` with `az monitor app-insights query` to compare `flagState` cohorts:
 
 ```bash
-bash scripts/rollout-flag.sh <appConfigName> 0
-bash scripts/get-flag.sh <appConfigName>
+query=$(cat scripts/query-flag-telemetry.kql)
+az monitor app-insights query --app <applicationInsightsName> --analytics-query "$query" --timespan 2h
 ```
 
-8. Roll the flag to 5% (pipeline stage or manual) and examine Application Insights using the provided KQL (`scripts/query-flag-telemetry.kql`) to compare `flagState == on` vs `off` cohorts.
+10) Simulate a spike at 25% (optional) and decide
 
-9. Roll the flag to 25% and (optionally) inject the simulated spike using `scripts/send-demo-traffic.sh` or the `?fault=1` query parameter to the risky endpoint. Inspect telemetry for error rate and latency deltas.
+- Roll to 25%: `bash scripts/rollout-flag.sh <appConfigName> 25`.
+- Optionally inject demo traffic that triggers failures: `bash scripts/send-demo-traffic.sh https://<app-host> 40 true`.
+- Re-run the Application Insights query and compare error rate and latency between `flagState == on` and `off` cohorts. If the on cohort shows a statistically significant degradation, immediately run the rollback step below.
 
-10. If the 25% stage shows unacceptable degradation, run:
+11) Instant rollback (if needed)
 
 ```bash
 bash scripts/rollback-flag.sh <appConfigName>
 ```
 
-to disable the flag instantly without redeploying.
+12) Complete rollout
 
-11. If telemetry is healthy, advance to 100% and capture final metrics snapshot via Application Insights and the KQL helper.
+- If telemetry is healthy, roll to 100%: `bash scripts/rollout-flag.sh <appConfigName> 100`.
+- Capture final metrics and export KQL results or screenshots for presentation.
 
-12. Document the final rollout decision, include the KQL outputs and screenshots, and add the rollback demonstration steps to `docs/canary-release.md` for presentation.
+13) Finalize documentation
+
+- Add the final telemetry outputs, incident notes (if any), and the rollback demo steps to `docs/canary-release.md`.
+
 
 ## Notes and Constraints
 
